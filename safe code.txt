@@ -2,20 +2,6 @@
 #include <stdlib.h>
 #include <stdint.h>
 
-/* ====================================================================
-   SIMPLE STABLE PD CONTROL — ANTI-WIGGLE RESET VERSION
-   --------------------------------------------------------------------
-   Use this after the previous version became super wiggly.
-
-   Main changes:
-   - Removed centre hysteresis.
-   - Removed memory steering.
-   - Removed hard instant steering.
-   - Very small derivative.
-   - Small right boost only.
-   - Lower steering correction.
-   - Lower speed until stable.
-   ==================================================================== */
 
 /* ================= SERVO VALUES ================= */
 
@@ -23,9 +9,7 @@
 #define SERVO_CENTRE        64
 #define SERVO_MAX_LEFT      110
 
-/*
-   Keep this as -1 because this fixed the steering direction earlier.
-*/
+
 #define STEER_SIGN          -1
 
 /* ================= MOTOR SPEED SETTINGS ================= */
@@ -185,7 +169,6 @@ void controlLoop(void)
 
     uint16_t total_signal = (uint16_t)(left_signal + right_signal);
 
-    /* If wire is lost, do NOT keep steering. Centre and slow down. */
     if (total_signal < MIN_SIGNAL)
     {
         error_filtered      = 0.0f;
@@ -200,11 +183,7 @@ void controlLoop(void)
 
     int16_t raw_error = left_signal - right_signal;
 
-    /*
-       raw_error > 0 means left sensor stronger.
-       With STEER_SIGN = -1, this steers right.
-       Right was slightly weak, so boost positive error very gently.
-    */
+
     int16_t control_error = raw_error;
 
     if (control_error > 0)
@@ -302,7 +281,6 @@ void main(void)
 
     __delay_ms(1000);
 
-    /* Servo self-test */
     setServoInstant(SERVO_MAX_RIGHT);
     __delay_ms(400);
 
@@ -315,7 +293,6 @@ void main(void)
     setServoInstant(SERVO_CENTRE);
     __delay_ms(700);
 
-    /* Wait for start button — keep sensors AWAY from wire */
     while (PORTAbits.RA3 == 1)
     {
         motorOff();
@@ -325,7 +302,6 @@ void main(void)
 
     __delay_ms(300);
 
-    /* Bias calibration — sensors AWAY from wire */
     uint32_t left_sum  = 0;
     uint32_t right_sum = 0;
 
