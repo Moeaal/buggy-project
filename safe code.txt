@@ -1,0 +1,359 @@
+#include "mcc_generated_files/system/system.h"
+#include <stdlib.h>
+#include <stdint.h>
+
+/* ====================================================================
+   SIMPLE STABLE PD CONTROL — ANTI-WIGGLE RESET VERSION
+   --------------------------------------------------------------------
+   Use this after the previous version became super wiggly.
+
+   Main changes:
+   - Removed centre hysteresis.
+   - Removed memory steering.
+   - Removed hard instant steering.
+   - Very small derivative.
+   - Small right boost only.
+   - Lower steering correction.
+   - Lower speed until stable.
+   ==================================================================== */
+
+/* ================= SERVO VALUES ================= */
+
+#define SERVO_MAX_RIGHT     20
+#define SERVO_CENTRE        64
+#define SERVO_MAX_LEFT      110
+
+/*
+   Keep this as -1 because this fixed the steering direction earlier.
+*/
+#define STEER_SIGN          -1
+
+/* ================= MOTOR SPEED SETTINGS ================= */
+
+#define DRIVE_FAST_SPEED        60
+#define DRIVE_BASE_SPEED        48
+#define DRIVE_TURN_SPEED        40
+#define DRIVE_HARD_TURN_SPEED   36
+#define DRIVE_MIN_SPEED         34
+
+/* ================= SENSOR SETTINGS ================= */
+
+#define ADC_SAMPLES             8
+#define CAL_SAMPLES             64
+
+#define MIN_SIGNAL              25
+
+#define DEAD_ERROR              32
+#define TURN_ERROR              80
+#define HARD_TURN_ERROR         130
+
+/* ================= RIGHT STEERING HELP ================= */
+
+#define RIGHT_ERROR_GAIN        1.08f
+#define RIGHT_STEER_BOOST       1.05f
+#define LEFT_STEER_BOOST        1.00f
+
+/* ================= PD CONTROL ================= */
+
+static float Kp = 0.20f;
+static float Kd = 0.06f;
+
+#define ERROR_FILTER            0.80f
+#define DERIV_FILTER            0.92f
+
+#define CORRECTION_LIMIT        24.0f
+
+#define SERVO_STEP_LIMIT        2
+
+/* ================= GLOBALS ================= */
+
+uint16_t left_idle  = 0;
+uint16_t right_idle = 0;
+
+int16_t current_servo = SERVO_CENTRE;
+
+volatile float error_filtered      = 0.0f;
+volatile float derivative_filtered = 0.0f;
+volatile int16_t prev_error        = 0;
+
+volatile uint8_t control_tick      = 0;
+
+/* ================= HELPERS ================= */
+
+static int16_t clamp_i16(int16_t value, int16_t min, int16_t max)
+{
+    if (value > max) return max;
+    if (value < min) return min;
+    return value;
+}
+
+static uint16_t clamp_u16(uint16_t value, uint16_t min, uint16_t max)
+{
+    if (value > max) return max;
+    if (value < min) return min;
+    return value;
+}
+
+static uint16_t readADCavg(adc_channel_t channel)
+{
+    uint32_t sum = 0;
+
+    for (uint8_t i = 0; i < ADC_SAMPLES; i++)
+    {
+        sum += (uint16_t)ADC_ChannelSelectAndConvert(channel);
+    }
+
+    return (uint16_t)(sum / ADC_SAMPLES);
+}
+
+static void setServoSmooth(int16_t target)
+{
+    target = clamp_i16(target, SERVO_MAX_RIGHT, SERVO_MAX_LEFT);
+
+    if (target > current_servo + SERVO_STEP_LIMIT)
+    {
+        current_servo += SERVO_STEP_LIMIT;
+    }
+    else if (target < current_servo - SERVO_STEP_LIMIT)
+    {
+        current_servo -= SERVO_STEP_LIMIT;
+    }
+    else
+    {
+        current_servo = target;
+    }
+
+    current_servo = clamp_i16(current_servo, SERVO_MAX_RIGHT, SERVO_MAX_LEFT);
+
+    CCP1_LoadDutyValue((uint16_t)current_servo);
+}
+
+static void setServoInstant(int16_t value)
+{
+    value = clamp_i16(value, SERVO_MAX_RIGHT, SERVO_MAX_LEFT);
+
+    current_servo = value;
+
+    CCP1_LoadDutyValue((uint16_t)value);
+}
+
+static void setMotor(uint16_t speed)
+{
+    if (speed > 0 && speed < DRIVE_MIN_SPEED)
+    {
+        speed = DRIVE_MIN_SPEED;
+    }
+
+    speed = clamp_u16(speed, 0, DRIVE_FAST_SPEED);
+
+    IO_RA4_SetLow();
+    PWM5_LoadDutyValue(speed);
+}
+
+static void motorOff(void)
+{
+    PWM5_LoadDutyValue(0);
+    IO_RA4_SetLow();
+}
+
+/* ================= TIMER CALLBACK ================= */
+
+void timerTick(void)
+{
+    control_tick = 1;
+}
+
+/* ================= CONTROL LOOP ================= */
+
+void controlLoop(void)
+{
+    uint16_t left_raw  = readADCavg(ADC_CHANNEL_ANC2);
+    uint16_t right_raw = readADCavg(ADC_CHANNEL_ANC3);
+
+    int16_t left_signal  = (int16_t)left_raw  - (int16_t)left_idle;
+    int16_t right_signal = (int16_t)right_raw - (int16_t)right_idle;
+
+    if (left_signal < 0)
+    {
+        left_signal = 0;
+    }
+
+    if (right_signal < 0)
+    {
+        right_signal = 0;
+    }
+
+    uint16_t total_signal = (uint16_t)(left_signal + right_signal);
+
+    /* If wire is lost, do NOT keep steering. Centre and slow down. */
+    if (total_signal < MIN_SIGNAL)
+    {
+        error_filtered      = 0.0f;
+        derivative_filtered = 0.0f;
+        prev_error          = 0;
+
+        setServoSmooth(SERVO_CENTRE);
+        setMotor(DRIVE_MIN_SPEED);
+
+        return;
+    }
+
+    int16_t raw_error = left_signal - right_signal;
+
+    /*
+       raw_error > 0 means left sensor stronger.
+       With STEER_SIGN = -1, this steers right.
+       Right was slightly weak, so boost positive error very gently.
+    */
+    int16_t control_error = raw_error;
+
+    if (control_error > 0)
+    {
+        control_error = (int16_t)((float)control_error * RIGHT_ERROR_GAIN);
+    }
+
+    int16_t abs_error = abs(control_error);
+
+    /* ================= DEAD ZONE ================= */
+
+    if (abs_error < DEAD_ERROR)
+    {
+        error_filtered      = 0.0f;
+        derivative_filtered = 0.0f;
+        prev_error          = 0;
+
+        setServoSmooth(SERVO_CENTRE);
+        setMotor(DRIVE_BASE_SPEED);
+
+        return;
+    }
+
+    /* ================= FILTER ERROR ================= */
+
+    error_filtered = (ERROR_FILTER * error_filtered) +
+                     ((1.0f - ERROR_FILTER) * (float)control_error);
+
+    int16_t error = (int16_t)error_filtered;
+
+    /* ================= DERIVATIVE ================= */
+
+    int16_t derivative = error - prev_error;
+
+    derivative_filtered = (DERIV_FILTER * derivative_filtered) +
+                          ((1.0f - DERIV_FILTER) * (float)derivative);
+
+    /* ================= PD CORRECTION ================= */
+
+    float correction = (Kp * (float)error) +
+                       (Kd * derivative_filtered);
+
+    if (correction > 0.0f)
+    {
+        correction *= RIGHT_STEER_BOOST;
+    }
+    else
+    {
+        correction *= LEFT_STEER_BOOST;
+    }
+
+    if (correction > CORRECTION_LIMIT)
+    {
+        correction = CORRECTION_LIMIT;
+    }
+
+    if (correction < -CORRECTION_LIMIT)
+    {
+        correction = -CORRECTION_LIMIT;
+    }
+
+    int16_t servo_value =
+        SERVO_CENTRE + (int16_t)(STEER_SIGN * correction);
+
+    setServoSmooth(servo_value);
+
+    /* ================= SPEED CONTROL ================= */
+
+    if (abs_error >= HARD_TURN_ERROR)
+    {
+        setMotor(DRIVE_HARD_TURN_SPEED);
+    }
+    else if (abs_error >= TURN_ERROR)
+    {
+        setMotor(DRIVE_TURN_SPEED);
+    }
+    else
+    {
+        setMotor(DRIVE_BASE_SPEED);
+    }
+
+    prev_error = error;
+}
+
+/* ================= MAIN ================= */
+
+void main(void)
+{
+    SYSTEM_Initialize();
+
+    motorOff();
+
+    current_servo = SERVO_CENTRE;
+    CCP1_LoadDutyValue(SERVO_CENTRE);
+
+    __delay_ms(1000);
+
+    /* Servo self-test */
+    setServoInstant(SERVO_MAX_RIGHT);
+    __delay_ms(400);
+
+    setServoInstant(SERVO_CENTRE);
+    __delay_ms(400);
+
+    setServoInstant(SERVO_MAX_LEFT);
+    __delay_ms(400);
+
+    setServoInstant(SERVO_CENTRE);
+    __delay_ms(700);
+
+    /* Wait for start button — keep sensors AWAY from wire */
+    while (PORTAbits.RA3 == 1)
+    {
+        motorOff();
+        setServoInstant(SERVO_CENTRE);
+        current_servo = SERVO_CENTRE;
+    }
+
+    __delay_ms(300);
+
+    /* Bias calibration — sensors AWAY from wire */
+    uint32_t left_sum  = 0;
+    uint32_t right_sum = 0;
+
+    for (uint8_t i = 0; i < CAL_SAMPLES; i++)
+    {
+        left_sum  += (uint16_t)ADC_ChannelSelectAndConvert(ADC_CHANNEL_ANC2);
+        right_sum += (uint16_t)ADC_ChannelSelectAndConvert(ADC_CHANNEL_ANC3);
+
+        __delay_ms(5);
+    }
+
+    left_idle  = (uint16_t)(left_sum  / CAL_SAMPLES);
+    right_idle = (uint16_t)(right_sum / CAL_SAMPLES);
+
+    setServoInstant(SERVO_CENTRE);
+    __delay_ms(300);
+
+    TMR0_OverflowCallbackRegister(timerTick);
+
+    INTERRUPT_GlobalInterruptEnable();
+    INTERRUPT_PeripheralInterruptEnable();
+
+    while (1)
+    {
+        if (control_tick)
+        {
+            control_tick = 0;
+            controlLoop();
+        }
+    }
+}
